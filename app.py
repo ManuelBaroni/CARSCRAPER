@@ -21,6 +21,8 @@ from database import (
     DEFAULT_DEAL_WEIGHTS,
     get_deal_score_weights,
     save_deal_score_weights,
+    escludi_annuncio_db,
+    ripristina_annuncio_escluso_db,
 )
 from scraper import run_scraper
 from analytics import calcola_statistiche_e_deal_score, toggle_favorite_db
@@ -395,7 +397,7 @@ with tab2:
     mostra_inc_tab2 = st.checkbox("🚨 Mostra anche auto incidentate / sinistrate (nascoste di default)", value=False, key="chk_inc_tab2")
     conn = sqlite3.connect(DB_NAME)
     df_annunci_preview = pd.read_sql("""
-        SELECT DISTINCT a.portale, a.marca, a.modello, a.versione, a.prezzo, a.anno, a.km, a.carburante,
+        SELECT DISTINCT a.id, a.portale, a.marca, a.modello, a.versione, a.prezzo, a.anno, a.km, a.carburante,
                         a.localita, a.regione, a.is_incidentata, a.tipo_venditore, a.data_annuncio, a.url
         FROM annunci a
         INNER JOIN alimentazioni_watchlist aw
@@ -404,6 +406,8 @@ with tab2:
             ON a.regione = r.regione
         WHERE aw.is_selected = 1
           AND r.is_selected = 1
+          AND a.id NOT IN (SELECT id FROM annunci_esclusi)
+          AND a.url NOT IN (SELECT url FROM annunci_esclusi WHERE url IS NOT NULL AND url != '')
         ORDER BY a.data_annuncio DESC
     """, conn)
     conn.close()
@@ -421,7 +425,7 @@ with tab2:
     else:
         st.markdown(f"<small style='color: #8b949e;'>Totale annunci visualizzati: **{len(df_annunci_preview)}** (Auto incidentate rilevate e nascoste/flaggate: **{num_inc_t2}**)</small>", unsafe_allow_html=True)
         st.dataframe(
-            df_annunci_preview.drop(columns=["is_incidentata"]),
+            df_annunci_preview.drop(columns=["id", "is_incidentata"]),
             width='stretch',
             column_config={
                 "url": st.column_config.LinkColumn("Link Annuncio", display_text="🔗 Apri Annuncio"),
@@ -434,10 +438,16 @@ with tab2:
         )
         for idx, row in df_annunci_preview.head(30).iterrows():
             inc_badge = " | 🚨 **INCIDENTATA**" if int(row['is_incidentata']) == 1 else ""
-            st.markdown(f"""
-            - **{row['marca']} {row['modello']}** ({row['anno']} - {row['km']:,} km) | **€ {row['prezzo']:,}** | ⛽ {row['carburante']} | 📍 **{row['localita']} ({row['regione']})** | 🏛️ {row['portale']}{inc_badge}
-            &nbsp;&nbsp;&nbsp;&nbsp;🔗 [Apri Singolo Annuncio Diretto]({row['url']})
-            """)
+            col_p1, col_p2 = st.columns([5, 1])
+            with col_p1:
+                st.markdown(f"""
+                - **{row['marca']} {row['modello']}** ({row['anno']} - {row['km']:,} km) | **€ {row['prezzo']:,}** | ⛽ {row['carburante']} | 📍 **{row['localita']} ({row['regione']})** | 🏛️ {row['portale']}{inc_badge}
+                &nbsp;&nbsp;&nbsp;&nbsp;🔗 [Apri Singolo Annuncio Diretto]({row['url']})
+                """)
+            with col_p2:
+                if st.button("🚫 Escludi", key=f"del_t2_{row['id']}", type="secondary"):
+                    escludi_annuncio_db(row["id"], row["url"], f"{row['marca']} {row['modello']} ({row['anno']}) - € {row['prezzo']}")
+                    st.rerun()
             st.divider()
 
 # ==========================================
@@ -569,6 +579,9 @@ with tab3:
                 if col_i5.button(f"{fav_icon} Preferito", key=f"fav_{row['id']}"):
                     toggle_favorite_db(row['id'], row['is_favorite'])
                     st.rerun()
+                if col_i5.button("🚫 Escludi", key=f"del_t3_{row['id']}", type="secondary"):
+                    escludi_annuncio_db(row["id"], row["url"], row["titolo"])
+                    st.rerun()
                 st.divider()
 
             st.markdown("#### 📈 Scatter Plot Interattivo: Prezzo vs Chilometraggio")
@@ -626,6 +639,10 @@ with tab3:
                 - **Portale**: {clicked_row['portale']} | **Venditore**: {clicked_row['tipo_venditore']}
                 - 🔗 **[Apri Singolo Annuncio Diretto]({clicked_row['url']})**
                 """)
+                if st.button("🚫 Elimina / Escludi questo annuncio (Anomalo)", key=f"del_scatter_{clicked_row['id']}", type="secondary"):
+                    escludi_annuncio_db(clicked_row["id"], clicked_row["url"], clicked_row["titolo"])
+                    st.success("Annuncio escluso da tutte le metriche e dagli scraping futuri!")
+                    st.rerun()
 
 # ==========================================
 # Tab 4: Area DEV & Manutenzione
@@ -668,9 +685,29 @@ with tab4:
         st.markdown("##### 📊 Log & Diagnostica Ultime Chiamate")
         conn = sqlite3.connect(DB_NAME)
         df_logs = pd.read_sql("SELECT timestamp, portale, status, annunci_salvati, tempo_risposta_sec, dettagli FROM scraping_logs ORDER BY id DESC LIMIT 20", conn)
+        df_esclusi = pd.read_sql("SELECT id, titolo, motivo, timestamp, url FROM annunci_esclusi ORDER BY timestamp DESC", conn)
         conn.close()
         
         if df_logs.empty:
             st.info("Nessun log registrato.")
         else:
             st.dataframe(df_logs, width='stretch')
+
+        st.markdown("---")
+        st.markdown(f"##### 🚫 Blacklist Annunci Esclusi Manualmente ({len(df_esclusi)})")
+        if df_esclusi.empty:
+            st.info("Nessun annuncio escluso manualmente.")
+        else:
+            st.dataframe(
+                df_esclusi,
+                width='stretch',
+                column_config={
+                    "url": st.column_config.LinkColumn("Link Annuncio", display_text="🔗 Apri"),
+                },
+            )
+            for _, ex_row in df_esclusi.head(15).iterrows():
+                c_ex1, c_ex2 = st.columns([4, 1])
+                c_ex1.markdown(f"<small>🚫 <b>{ex_row['titolo']}</b> ({ex_row['timestamp']})</small>", unsafe_allow_html=True)
+                if c_ex2.button("Ripristina", key=f"rest_{ex_row['id']}"):
+                    ripristina_annuncio_escluso_db(ex_row["id"])
+                    st.rerun()
